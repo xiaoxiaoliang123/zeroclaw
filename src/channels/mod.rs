@@ -3885,6 +3885,8 @@ fn collect_configured_channels(
             display_name: "WeCom",
             channel: Arc::new(WeComChannel::new(
                 wc.webhook_key.clone(),
+                wc.bot_id.clone(),
+                wc.bot_secret.clone(),
                 wc.allowed_users.clone(),
             )),
         });

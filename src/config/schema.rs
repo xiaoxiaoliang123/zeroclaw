@@ -5609,8 +5609,15 @@ impl ChannelConfig for DingTalkConfig {
 /// WeCom (WeChat Enterprise) Bot Webhook configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WeComConfig {
-    /// Webhook key from WeCom Bot configuration
-    pub webhook_key: String,
+    /// Webhook key from WeCom Bot configuration (optional, for webhook mode)
+    #[serde(default)]
+    pub webhook_key: Option<String>,
+    /// Bot ID from WeCom Bot configuration (optional, for WebSocket mode)
+    #[serde(default)]
+    pub bot_id: Option<String>,
+    /// Bot Secret from WeCom Bot configuration (optional, for WebSocket mode)
+    #[serde(default, alias = "secret")]
+    pub bot_secret: Option<String>,
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -5621,7 +5628,7 @@ impl ChannelConfig for WeComConfig {
         "WeCom"
     }
     fn desc() -> &'static str {
-        "WeCom Bot Webhook"
+        "WeCom Bot (Webhook or WebSocket)"
     }
 }
 
@@ -7012,11 +7019,13 @@ impl Config {
                 )?;
             }
             if let Some(ref mut wc) = config.channels_config.wecom {
-                decrypt_secret(
-                    &store,
-                    &mut wc.webhook_key,
-                    "config.channels_config.wecom.webhook_key",
-                )?;
+                if let Some(ref mut webhook_key) = &mut wc.webhook_key {
+                    decrypt_secret(
+                        &store,
+                        webhook_key,
+                        "config.channels_config.wecom.webhook_key",
+                    )?;
+                }
             }
             if let Some(ref mut qq) = config.channels_config.qq {
                 decrypt_secret(
@@ -8291,11 +8300,13 @@ impl Config {
             )?;
         }
         if let Some(ref mut wc) = config_to_save.channels_config.wecom {
-            encrypt_secret(
-                &store,
-                &mut wc.webhook_key,
-                "config.channels_config.wecom.webhook_key",
-            )?;
+            if let Some(ref mut webhook_key) = &mut wc.webhook_key {
+                encrypt_secret(
+                    &store,
+                    webhook_key,
+                    "config.channels_config.wecom.webhook_key",
+                )?;
+            }
         }
         if let Some(ref mut qq) = config_to_save.channels_config.qq {
             encrypt_secret(
