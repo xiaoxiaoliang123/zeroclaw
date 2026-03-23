@@ -19,11 +19,14 @@ pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
+pub mod discord_history;
 pub mod email_channel;
+pub mod gmail_push;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+pub mod link_enricher;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
@@ -45,6 +48,8 @@ pub mod traits;
 pub mod transcription;
 pub mod tts;
 pub mod twitter;
+#[cfg(feature = "voice-wake")]
+pub mod voice_wake;
 pub mod wati;
 pub mod webhook;
 pub mod wecom;
@@ -59,7 +64,9 @@ pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
+pub use discord_history::DiscordHistoryChannel;
 pub use email_channel::EmailChannel;
+pub use gmail_push::GmailPushChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
@@ -82,6 +89,8 @@ pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
+#[cfg(feature = "voice-wake")]
+pub use voice_wake::VoiceWakeChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
@@ -89,7 +98,10 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::{
+    build_tool_instructions, clear_model_switch_request, get_model_switch_state,
+    is_model_switch_requested, run_tool_call_loop, scrub_credentials,
+};
 use crate::approval::ApprovalManager;
 use crate::config::Config;
 use crate::identity;
@@ -220,8 +232,20 @@ fn channel_message_timeout_budget_secs(
     message_timeout_secs: u64,
     max_tool_iterations: usize,
 ) -> u64 {
+    channel_message_timeout_budget_secs_with_cap(
+        message_timeout_secs,
+        max_tool_iterations,
+        CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP,
+    )
+}
+
+fn channel_message_timeout_budget_secs_with_cap(
+    message_timeout_secs: u64,
+    max_tool_iterations: usize,
+    scale_cap: u64,
+) -> u64 {
     let iterations = max_tool_iterations.max(1) as u64;
-    let scale = iterations.min(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
+    let scale = iterations.min(scale_cap);
     message_timeout_secs.saturating_mul(scale)
 }
 
@@ -294,6 +318,7 @@ struct InterruptOnNewMessageConfig {
     slack: bool,
     discord: bool,
     mattermost: bool,
+    matrix: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -303,9 +328,16 @@ impl InterruptOnNewMessageConfig {
             "slack" => self.slack,
             "discord" => self.discord,
             "mattermost" => self.mattermost,
+            "matrix" => self.matrix,
             _ => false,
         }
     }
+}
+
+#[derive(Clone)]
+struct ChannelCostTrackingState {
+    tracker: Arc<crate::cost::CostTracker>,
+    prices: Arc<HashMap<String, crate::config::schema::ModelPricing>>,
 }
 
 #[derive(Clone)]
@@ -350,6 +382,8 @@ struct ChannelRuntimeContext {
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
     activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    cost_tracking: Option<ChannelCostTrackingState>,
+    pacing: crate::config::PacingConfig,
 }
 
 #[derive(Clone)]
@@ -569,6 +603,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "qq" => Some(
+            "When responding on QQ:\n\
+             - Use Markdown formatting\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
+             - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         _ => None,
     }
@@ -1497,7 +1540,7 @@ async fn build_memory_context(
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id, None, None).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -2024,6 +2067,25 @@ async fn process_channel_message(
         msg
     };
 
+    // ── Link enricher: prepend URL summaries before agent sees the message ──
+    let le_config = &ctx.prompt_config.link_enricher;
+    if le_config.enabled {
+        let enricher_cfg = link_enricher::LinkEnricherConfig {
+            enabled: le_config.enabled,
+            max_links: le_config.max_links,
+            timeout_secs: le_config.timeout_secs,
+        };
+        let enriched = link_enricher::enrich_message(&msg.content, &enricher_cfg).await;
+        if enriched != msg.content {
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "Link enricher: prepended URL summaries to message"
+            );
+            msg.content = enriched;
+        }
+    }
+
     let target_channel = ctx
         .channels_by_name
         .get(&msg.channel)
@@ -2070,7 +2132,7 @@ async fn process_channel_message(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(
+    let mut active_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.provider,
         route.api_key.as_deref(),
@@ -2192,30 +2254,63 @@ async fn process_channel_message(
         );
     }
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
-        let memory_context = build_memory_context(
+    // ── Dual-scope memory recall ──────────────────────────────────
+    // Always recall before each LLM call (not just first turn).
+    // For group chats: merge sender-scope + group-scope memories.
+    // For DMs: sender-scope only.
+    let is_group_chat =
+        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+
+    let mem_recall_start = Instant::now();
+    let sender_memory_fut = build_memory_context(
+        ctx.memory.as_ref(),
+        &msg.content,
+        ctx.min_relevance_score,
+        Some(&msg.sender),
+    );
+
+    let (sender_memory, group_memory) = if is_group_chat {
+        let group_memory_fut = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
             ctx.min_relevance_score,
             Some(&history_key),
-        )
-        .await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
-            }
-        }
-    }
+        );
+        tokio::join!(sender_memory_fut, group_memory_fut)
+    } else {
+        (sender_memory_fut.await, String::new())
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        mem_recall_ms,
+        sender_empty = sender_memory.is_empty(),
+        group_empty = group_memory.is_empty(),
+        "⏱ Memory recall completed"
+    );
 
+    // Merge sender + group memories, avoiding duplicates
+    let memory_context = if group_memory.is_empty() {
+        sender_memory
+    } else if sender_memory.is_empty() {
+        group_memory
+    } else {
+        format!("{sender_memory}\n{group_memory}")
+    };
+
+    // Use refreshed system prompt for new sessions (master's /new support),
+    // and inject memory into system prompt (not user message) so it
+    // doesn't pollute session history and is re-fetched each turn.
     let base_system_prompt = if had_prior_history {
         ctx.system_prompt.as_str().to_string()
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let system_prompt =
+    let mut system_prompt =
         build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+    if !memory_context.is_empty() {
+        let _ = write!(system_prompt, "\n\n{memory_context}");
+    }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -2347,41 +2442,106 @@ async fn process_channel_message(
         Cancelled,
     }
 
-    let timeout_budget_secs =
-        channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
-    let llm_result = tokio::select! {
-        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-        result = tokio::time::timeout(
-            Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                notify_observer.as_ref() as &dyn Observer,
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                Some(&*ctx.approval_manager),
-                msg.channel.as_str(),
-                Some(msg.reply_target.as_str()),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                if msg.channel == "cli"
-                    || ctx.autonomy_level == AutonomyLevel::Full
+    let model_switch_callback = get_model_switch_state();
+    let scale_cap = ctx
+        .pacing
+        .message_timeout_scale_max
+        .unwrap_or(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
+    let timeout_budget_secs = channel_message_timeout_budget_secs_with_cap(
+        ctx.message_timeout_secs,
+        ctx.max_tool_iterations,
+        scale_cap,
+    );
+    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
+        crate::agent::loop_::ToolLoopCostTrackingContext::new(state.tracker, state.prices)
+    });
+    let llm_call_start = Instant::now();
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
+    let llm_result = loop {
+        let loop_result = tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            result = tokio::time::timeout(
+                Duration::from_secs(timeout_budget_secs),
+                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    cost_tracking_context.clone(),
+                run_tool_call_loop(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    notify_observer.as_ref() as &dyn Observer,
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(&*ctx.approval_manager),
+                    msg.channel.as_str(),
+                    Some(msg.reply_target.as_str()),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx.clone(),
+                    ctx.hooks.as_deref(),
+                    if msg.channel == "cli"
+                        || ctx.autonomy_level == AutonomyLevel::Full
+                    {
+                        &[]
+                    } else {
+                        ctx.non_cli_excluded_tools.as_ref()
+                    },
+                    ctx.tool_call_dedup_exempt.as_ref(),
+                    ctx.activated_tools.as_ref(),
+                    Some(model_switch_callback.clone()),
+                    &ctx.pacing,
+                ),
+                ),
+            ) => LlmExecutionResult::Completed(result),
+        };
+
+        // Handle model switch: re-create the provider and retry
+        if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
+            if let Some((new_provider, new_model)) = is_model_switch_requested(e) {
+                tracing::info!(
+                    "Model switch requested, switching from {} {} to {} {}",
+                    route.provider,
+                    route.model,
+                    new_provider,
+                    new_model
+                );
+
+                match create_resilient_provider_nonblocking(
+                    &new_provider,
+                    ctx.api_key.clone(),
+                    ctx.api_url.clone(),
+                    ctx.reliability.as_ref().clone(),
+                    ctx.provider_runtime_options.clone(),
+                )
+                .await
                 {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
-                ctx.tool_call_dedup_exempt.as_ref(),
-                ctx.activated_tools.as_ref(),
-                None,
-            ),
-        ) => LlmExecutionResult::Completed(result),
+                    Ok(new_prov) => {
+                        active_provider = Arc::from(new_prov);
+                        route.provider = new_provider;
+                        route.model = new_model;
+                        clear_model_switch_request();
+
+                        ctx.observer.record_event(&ObserverEvent::AgentStart {
+                            provider: route.provider.clone(),
+                            model: route.model.clone(),
+                        });
+
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to create provider after model switch: {err}");
+                        clear_model_switch_request();
+                        // Fall through with the original error
+                    }
+                }
+            }
+        }
+
+        break loop_result;
     };
 
     if let Some(handle) = draft_updater {
@@ -2398,6 +2558,12 @@ async fn process_channel_message(
     if let Some(handle) = notify_task {
         let _ = handle.await;
     }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let llm_call_ms = llm_call_start.elapsed().as_millis() as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let total_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
 
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
@@ -2507,6 +2673,7 @@ async fn process_channel_message(
             } else {
                 sanitized_response
             };
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -2581,7 +2748,7 @@ async fn process_channel_message(
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
+                        &SendMessage::new(&delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -2989,9 +3156,12 @@ pub fn build_system_prompt_with_mode(
         Some(&autonomy_cfg),
         native_tools,
         skills_prompt_mode,
+        false,
+        0,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt_with_mode_and_autonomy(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -3002,6 +3172,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     autonomy_config: Option<&crate::config::AutonomyConfig>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    compact_context: bool,
+    max_system_prompt_chars: usize,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -3028,11 +3200,19 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
-        prompt.push_str("You have access to the following tools:\n\n");
-        for (name, desc) in tools {
-            let _ = writeln!(prompt, "- **{name}**: {desc}");
+        if compact_context {
+            // Compact mode: tool names only, no descriptions/schemas
+            prompt.push_str("Available tools: ");
+            let names: Vec<&str> = tools.iter().map(|(name, _)| *name).collect();
+            prompt.push_str(&names.join(", "));
+            prompt.push_str("\n\n");
+        } else {
+            prompt.push_str("You have access to the following tools:\n\n");
+            for (name, desc) in tools {
+                let _ = writeln!(prompt, "- **{name}**: {desc}");
+            }
+            prompt.push('\n');
         }
-        prompt.push('\n');
     }
 
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
@@ -3176,11 +3356,13 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         std::env::consts::OS,
     );
 
-    // ── 8. Channel Capabilities ─────────────────────────────────────
-    prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
-    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
-    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+    // ── 8. Channel Capabilities (skipped in compact_context mode) ──
+    if !compact_context {
+        prompt.push_str("## Channel Capabilities\n\n");
+        prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
+        prompt
+            .push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+        prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
              - Never pretend you are waiting for a human approval click or confirmation when the runtime policy already permits the action.\n\
@@ -3194,10 +3376,23 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
         }
     });
-    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
-    prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
+        prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
+        prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
+        prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
+        prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
+    } // end if !compact_context (Channel Capabilities)
+
+    // ── 9. Truncation (max_system_prompt_chars budget) ──────────
+    if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
+        // Truncate on a char boundary, keeping the top portion (identity + safety).
+        let mut end = max_system_prompt_chars;
+        // Ensure we don't split a multi-byte UTF-8 character.
+        while !prompt.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        prompt.truncate(end);
+        prompt.push_str("\n\n[System prompt truncated to fit context budget]\n");
+    }
 
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
@@ -3495,13 +3690,16 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .discord
                 .as_ref()
                 .context("Discord channel is not configured")?;
-            Ok(Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )))
+            Ok(Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                .with_transcription(config.transcription.clone()),
+            ))
         }
         "slack" => {
             let sl = config
@@ -3517,7 +3715,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     Vec::new(),
                     sl.allowed_users.clone(),
                 )
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_transcription(config.transcription.clone()),
             ))
         }
         other => anyhow::bail!("Unknown channel '{other}'. Supported: telegram, discord, slack"),
@@ -3586,7 +3785,8 @@ fn collect_configured_channels(
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_proxy_url(tg.proxy_url.clone()),
             ),
         });
     }
@@ -3594,14 +3794,43 @@ fn collect_configured_channels(
     if let Some(ref dc) = config.channels_config.discord {
         channels.push(ConfiguredChannel {
             display_name: "Discord",
-            channel: Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )),
+            channel: Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                .with_proxy_url(dc.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
+            ),
         });
+    }
+
+    if let Some(ref dh) = config.channels_config.discord_history {
+        match crate::memory::SqliteMemory::new_named(&config.workspace_dir, "discord") {
+            Ok(discord_mem) => {
+                channels.push(ConfiguredChannel {
+                    display_name: "Discord History",
+                    channel: Arc::new(
+                        DiscordHistoryChannel::new(
+                            dh.bot_token.clone(),
+                            dh.guild_id.clone(),
+                            dh.allowed_users.clone(),
+                            dh.channel_ids.clone(),
+                            Arc::new(discord_mem),
+                            dh.store_dms,
+                            dh.respond_to_dms,
+                        )
+                        .with_proxy_url(dh.proxy_url.clone()),
+                    ),
+                });
+            }
+            Err(e) => {
+                tracing::error!("discord_history: failed to open discord.db: {e}");
+            }
+        }
     }
 
     if let Some(ref sl) = config.channels_config.slack {
@@ -3617,7 +3846,9 @@ fn collect_configured_channels(
                 )
                 .with_thread_replies(sl.thread_replies.unwrap_or(true))
                 .with_group_reply_policy(sl.mention_only, Vec::new())
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_proxy_url(sl.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
             ),
         });
     }
@@ -3625,14 +3856,17 @@ fn collect_configured_channels(
     if let Some(ref mm) = config.channels_config.mattermost {
         channels.push(ConfiguredChannel {
             display_name: "Mattermost",
-            channel: Arc::new(MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            )),
+            channel: Arc::new(
+                MattermostChannel::new(
+                    mm.url.clone(),
+                    mm.bot_token.clone(),
+                    mm.channel_id.clone(),
+                    mm.allowed_users.clone(),
+                    mm.thread_replies.unwrap_or(true),
+                    mm.mention_only.unwrap_or(false),
+                )
+                .with_proxy_url(mm.proxy_url.clone()),
+            ),
         });
     }
 
@@ -3647,11 +3881,12 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+            channel: Arc::new(MatrixChannel::new_full(
                 mx.homeserver.clone(),
                 mx.access_token.clone(),
                 mx.room_id.clone(),
                 mx.allowed_users.clone(),
+                mx.allowed_rooms.clone(),
                 mx.user_id.clone(),
                 mx.device_id.clone(),
                 config.config_path.parent().map(|path| path.to_path_buf()),
@@ -3670,14 +3905,17 @@ fn collect_configured_channels(
     if let Some(ref sig) = config.channels_config.signal {
         channels.push(ConfiguredChannel {
             display_name: "Signal",
-            channel: Arc::new(SignalChannel::new(
-                sig.http_url.clone(),
-                sig.account.clone(),
-                sig.group_id.clone(),
-                sig.allowed_from.clone(),
-                sig.ignore_attachments,
-                sig.ignore_stories,
-            )),
+            channel: Arc::new(
+                SignalChannel::new(
+                    sig.http_url.clone(),
+                    sig.account.clone(),
+                    sig.group_id.clone(),
+                    sig.allowed_from.clone(),
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
+                )
+                .with_proxy_url(sig.proxy_url.clone()),
+            ),
         });
     }
 
@@ -3694,12 +3932,15 @@ fn collect_configured_channels(
                 if wa.is_cloud_config() {
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppChannel::new(
-                            wa.access_token.clone().unwrap_or_default(),
-                            wa.phone_number_id.clone().unwrap_or_default(),
-                            wa.verify_token.clone().unwrap_or_default(),
-                            wa.allowed_numbers.clone(),
-                        )),
+                        channel: Arc::new(
+                            WhatsAppChannel::new(
+                                wa.access_token.clone().unwrap_or_default(),
+                                wa.phone_number_id.clone().unwrap_or_default(),
+                                wa.verify_token.clone().unwrap_or_default(),
+                                wa.allowed_numbers.clone(),
+                            )
+                            .with_proxy_url(wa.proxy_url.clone()),
+                        ),
                     });
                 } else {
                     tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
@@ -3717,6 +3958,10 @@ fn collect_configured_channels(
                                 wa.pair_phone.clone(),
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
+                                wa.mode.clone(),
+                                wa.dm_policy.clone(),
+                                wa.group_policy.clone(),
+                                wa.self_chat_mode,
                             )
                             .with_transcription(config.transcription.clone())
                             .with_tts(config.tts.clone()),
@@ -3752,11 +3997,12 @@ fn collect_configured_channels(
     if let Some(ref wati_cfg) = config.channels_config.wati {
         channels.push(ConfiguredChannel {
             display_name: "WATI",
-            channel: Arc::new(WatiChannel::new(
+            channel: Arc::new(WatiChannel::new_with_proxy(
                 wati_cfg.api_token.clone(),
                 wati_cfg.api_url.clone(),
                 wati_cfg.tenant_id.clone(),
                 wati_cfg.allowed_numbers.clone(),
+                wati_cfg.proxy_url.clone(),
             )),
         });
     }
@@ -3764,10 +4010,11 @@ fn collect_configured_channels(
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
         channels.push(ConfiguredChannel {
             display_name: "Nextcloud Talk",
-            channel: Arc::new(NextcloudTalkChannel::new(
+            channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
                 nc.allowed_users.clone(),
+                nc.proxy_url.clone(),
             )),
         });
     }
@@ -3777,6 +4024,15 @@ fn collect_configured_channels(
             display_name: "Email",
             channel: Arc::new(EmailChannel::new(email_cfg.clone())),
         });
+    }
+
+    if let Some(ref gp_cfg) = config.channels_config.gmail_push {
+        if gp_cfg.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Gmail Push",
+                channel: Arc::new(GmailPushChannel::new(gp_cfg.clone())),
+            });
+        }
     }
 
     if let Some(ref irc) = config.channels_config.irc {
@@ -3839,22 +4095,29 @@ fn collect_configured_channels(
     if let Some(ref dt) = config.channels_config.dingtalk {
         channels.push(ConfiguredChannel {
             display_name: "DingTalk",
-            channel: Arc::new(DingTalkChannel::new(
-                dt.client_id.clone(),
-                dt.client_secret.clone(),
-                dt.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                DingTalkChannel::new(
+                    dt.client_id.clone(),
+                    dt.client_secret.clone(),
+                    dt.allowed_users.clone(),
+                )
+                .with_proxy_url(dt.proxy_url.clone()),
+            ),
         });
     }
 
     if let Some(ref qq) = config.channels_config.qq {
         channels.push(ConfiguredChannel {
             display_name: "QQ",
-            channel: Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_proxy_url(qq.proxy_url.clone()),
+            ),
         });
     }
 
@@ -3946,6 +4209,17 @@ fn collect_configured_channels(
             channel: Arc::new(BlueskyChannel::new(
                 bs.handle.clone(),
                 bs.app_password.clone(),
+            )),
+        });
+    }
+
+    #[cfg(feature = "voice-wake")]
+    if let Some(ref vw) = config.channels_config.voice_wake {
+        channels.push(ConfiguredChannel {
+            display_name: "VoiceWake",
+            channel: Arc::new(VoiceWakeChannel::new(
+                vw.clone(),
+                config.transcription.clone(),
             )),
         });
     }
@@ -4100,22 +4374,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch): (Vec<Box<dyn Tool>>, _) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &workspace,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-        );
+    let (mut built_tools, delegate_handle_ch, reaction_handle_ch) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &workspace,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None,
+    );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
@@ -4288,6 +4562,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.compact_context,
+        config.agent.max_system_prompt_chars,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(
@@ -4387,6 +4663,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+
+    // Populate the reaction tool's channel map now that channels are initialized.
+    if let Some(ref handle) = reaction_handle_ch {
+        let mut map = handle.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -4415,6 +4700,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .mattermost
         .as_ref()
         .is_some_and(|mm| mm.interrupt_on_new_message);
+    let interrupt_on_new_message_matrix = config
+        .channels_config
+        .matrix
+        .as_ref()
+        .is_some_and(|mx| mx.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -4445,6 +4735,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             slack: interrupt_on_new_message_slack,
             discord: interrupt_on_new_message_discord,
             mattermost: interrupt_on_new_message_mattermost,
+            matrix: interrupt_on_new_message_matrix,
         },
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
@@ -4484,6 +4775,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
+        cost_tracking: crate::cost::CostTracker::get_or_init_global(
+            config.cost.clone(),
+            &config.workspace_dir,
+        )
+        .map(|tracker| ChannelCostTrackingState {
+            tracker,
+            prices: Arc::new(config.cost.prices.clone()),
+        }),
+        pacing: config.pacing.clone(),
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -4576,6 +4876,49 @@ mod tests {
         // Large iteration counts are capped to avoid runaway waits.
         assert_eq!(
             channel_message_timeout_budget_secs(300, 10),
+            300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
+        );
+    }
+
+    #[test]
+    fn channel_message_timeout_budget_with_custom_scale_cap() {
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 8, 8),
+            300 * 8
+        );
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 20, 8),
+            300 * 8
+        );
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 10, 1),
+            300
+        );
+    }
+
+    #[test]
+    fn pacing_config_defaults_preserve_existing_behavior() {
+        let pacing = crate::config::PacingConfig::default();
+        assert!(pacing.step_timeout_secs.is_none());
+        assert!(pacing.loop_detection_min_elapsed_secs.is_none());
+        assert!(pacing.loop_ignore_tools.is_empty());
+        assert!(pacing.message_timeout_scale_max.is_none());
+    }
+
+    #[test]
+    fn pacing_message_timeout_scale_max_overrides_default_cap() {
+        // Custom cap of 8 scales budget proportionally
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 10, 8),
+            300 * 8
+        );
+        // Default cap produces the standard behavior
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(
+                300,
+                10,
+                CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
+            ),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
     }
@@ -4763,6 +5106,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4782,6 +5126,8 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4877,6 +5223,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4896,6 +5243,8 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4947,6 +5296,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4966,6 +5316,8 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -5036,6 +5388,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5055,6 +5408,8 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         };
 
         assert!(rollback_orphan_user_turn(
@@ -5579,6 +5934,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5594,6 +5950,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -5658,6 +6016,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5673,6 +6032,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -5751,6 +6112,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5766,6 +6128,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -5829,6 +6193,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5844,6 +6209,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -5917,6 +6284,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5932,6 +6300,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6026,6 +6396,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6041,6 +6412,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6116,6 +6489,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6131,6 +6505,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6221,6 +6597,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6236,6 +6613,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6311,6 +6690,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6326,6 +6706,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6391,6 +6773,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6406,6 +6789,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6454,6 +6839,8 @@ BTC is currently around $65,000 based on latest tool output."#
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -6506,6 +6893,8 @@ BTC is currently around $65,000 based on latest tool output."#
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![crate::memory::MemoryEntry {
                 id: "entry-1".to_string(),
@@ -6515,6 +6904,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: "2026-02-20T00:00:00Z".to_string(),
                 session_id: None,
                 score: Some(0.9),
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
             }])
         }
 
@@ -6582,6 +6974,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6597,6 +6990,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6682,6 +7077,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6697,6 +7093,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6797,6 +7195,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: true,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -6811,7 +7210,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6909,6 +7310,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6924,6 +7326,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7003,6 +7407,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7018,6 +7423,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -7081,6 +7488,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7096,6 +7504,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -7318,9 +7728,9 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<instructions>"));
         assert!(prompt
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>lint</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names
+        assert!(prompt.contains("<callable_tools"));
+        assert!(prompt.contains("<name>code-review.lint</name>"));
         assert!(!prompt.contains("loaded on demand"));
     }
 
@@ -7363,10 +7773,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        // Compact mode should still include tools so the LLM knows about them
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>lint</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // Compact mode should still include tools so the LLM knows about them.
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
+        assert!(prompt.contains("<callable_tools"));
+        assert!(prompt.contains("<name>code-review.lint</name>"));
     }
 
     #[test]
@@ -7488,6 +7898,8 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            false,
+            0,
         );
 
         assert!(
@@ -7517,6 +7929,8 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            false,
+            0,
         );
 
         assert!(
@@ -7748,7 +8162,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5, None).await.unwrap();
+        let recalled = mem.recall("45", 5, None, None, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
@@ -7845,6 +8259,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7860,6 +8275,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -7974,6 +8391,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7989,6 +8407,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -8143,6 +8563,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8158,6 +8579,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -8182,10 +8605,12 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
+        // Memory context is injected into the system prompt, not the user message.
+        assert_eq!(calls[0][0].0, "system");
+        assert!(calls[0][0].1.contains("[Memory context]"));
+        assert!(calls[0][0].1.contains("Age is 45"));
         assert_eq!(calls[0][1].0, "user");
-        assert!(calls[0][1].1.contains("[Memory context]"));
-        assert!(calls[0][1].1.contains("Age is 45"));
-        assert!(calls[0][1].1.contains("hello"));
+        assert_eq!(calls[0][1].1, "hello");
 
         let histories = runtime_ctx
             .conversation_histories
@@ -8247,6 +8672,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8262,6 +8688,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -8579,6 +9007,7 @@ This is an example JSON object for profile settings."#;
             thread_replies: Some(true),
             mention_only: Some(false),
             interrupt_on_new_message: false,
+            proxy_url: None,
         });
 
         let channels = collect_configured_channels(&config, "test");
@@ -8816,6 +9245,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8831,6 +9261,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -8901,6 +9333,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8916,6 +9349,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -9061,6 +9496,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9076,6 +9512,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -9170,6 +9608,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9185,6 +9624,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -9271,6 +9712,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9286,6 +9728,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -9392,6 +9836,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9407,6 +9852,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -9465,6 +9912,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
@@ -9522,6 +9970,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: true,
+            matrix: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -9533,6 +9982,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            matrix: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -9544,6 +9994,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: true,
             mattermost: false,
+            matrix: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
     }
@@ -9555,6 +10006,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            matrix: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
@@ -9646,6 +10098,7 @@ This is an example JSON object for profile settings."#;
                 slack: true,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9661,6 +10114,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);

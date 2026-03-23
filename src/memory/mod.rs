@@ -1,22 +1,33 @@
+pub mod audit;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+pub mod conflict;
 pub mod consolidation;
+pub mod decay;
 pub mod embeddings;
 pub mod hygiene;
+pub mod importance;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+pub mod policy;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
+pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
 pub mod vector;
 
+#[cfg(test)]
+mod battle_tests;
+
+#[allow(unused_imports)]
+pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
@@ -25,14 +36,18 @@ pub use backend::{
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
+#[allow(unused_imports)]
+pub use policy::PolicyEnforcer;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
+#[allow(unused_imports)]
+pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry};
+pub use traits::{MemoryCategory, MemoryEntry, ProceduralMessage};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;

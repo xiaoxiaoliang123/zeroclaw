@@ -1,14 +1,16 @@
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
+#[cfg(feature = "whatsapp-web")]
+use crate::channels::WhatsAppWebChannel;
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
-    TelegramChannel,
+    Channel, DiscordChannel, MattermostChannel, QQChannel, SendMessage, SignalChannel,
+    SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
     all_overdue_jobs, due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
-    reschedule_after_run, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
-    SessionTarget,
+    reschedule_after_run, sync_declarative_jobs, update_job, CronJob, CronJobPatch, DeliveryConfig,
+    JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -33,6 +35,19 @@ pub async fn run(config: Config) -> Result<()> {
     ));
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+
+    // ── Declarative job sync: reconcile config-defined jobs with the DB.
+    match sync_declarative_jobs(&config, &config.cron.jobs) {
+        Ok(()) => {
+            if !config.cron.jobs.is_empty() {
+                tracing::info!(
+                    count = config.cron.jobs.len(),
+                    "Synced declarative cron jobs from config"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Failed to sync declarative cron jobs: {e}"),
+    }
 
     // ── Startup catch-up: run ALL overdue jobs before entering the
     //    normal polling loop. The regular loop is capped by `max_tasks`,
@@ -483,6 +498,49 @@ pub(crate) async fn deliver_announcement(
                 anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
             }
         }
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            #[cfg(feature = "whatsapp-web")]
+            {
+                let wa = config
+                    .channels_config
+                    .whatsapp
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+                if !wa.is_web_config() {
+                    anyhow::bail!(
+                        "whatsapp cron delivery requires Web mode (session_path must be set)"
+                    );
+                }
+                let channel = WhatsAppWebChannel::new(
+                    wa.session_path.clone().unwrap_or_default(),
+                    wa.pair_phone.clone(),
+                    wa.pair_code.clone(),
+                    wa.allowed_numbers.clone(),
+                    wa.mode.clone(),
+                    wa.dm_policy.clone(),
+                    wa.group_policy.clone(),
+                    wa.self_chat_mode,
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "whatsapp-web"))]
+            {
+                anyhow::bail!("whatsapp delivery channel requires `whatsapp-web` feature");
+            }
+        }
+        "qq" => {
+            let qq = config
+                .channels_config
+                .qq
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
+            let channel = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 
@@ -644,6 +702,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,

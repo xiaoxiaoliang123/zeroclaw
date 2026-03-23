@@ -4,29 +4,34 @@ pub mod workspace;
 
 #[allow(unused_imports)]
 pub use schema::{
-    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    apply_channel_proxy_to_builder, apply_runtime_proxy_to_builder, build_channel_proxy_client,
+    build_channel_proxy_client_with_timeouts, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig,
     BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
-    ClassificationRule, CloudOpsConfig, ComposioConfig, Config, ConversationalAiConfig, CostConfig,
-    CronConfig, DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DelegateToolConfig,
-    DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig,
-    EstopConfig, FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig,
+    ClassificationRule, ClaudeCodeConfig, CloudOpsConfig, ComposioConfig, Config,
+    ConversationalAiConfig, CostConfig, CronConfig, CronJobDecl, CronScheduleDecl,
+    DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DelegateToolConfig, DiscordConfig,
+    DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig,
+    FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceAllowedOperation,
     GoogleWorkspaceConfig, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, ImageProviderDalleConfig,
+    HttpRequestConfig, IMessageConfig, IdentityConfig, ImageGenConfig, ImageProviderDalleConfig,
     ImageProviderFluxConfig, ImageProviderImagenConfig, ImageProviderStabilityConfig, JiraConfig,
-    KnowledgeConfig, LarkConfig, LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig,
-    MatrixConfig, McpConfig, McpServerConfig, McpTransport, MemoryConfig, Microsoft365Config,
-    ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, NodeTransportConfig, NodesConfig,
-    NotionConfig, ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig, OpenVpnTunnelConfig,
-    OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, PluginsConfig,
-    ProjectIntelConfig, ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig,
-    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SecurityOpsConfig, SkillCreationConfig,
-    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig,
-    TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig,
-    TunnelConfig, WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspaceConfig,
+    KnowledgeConfig, LarkConfig, LinkEnricherConfig, LinkedInConfig, LinkedInContentConfig,
+    LinkedInImageConfig, LocalWhisperConfig, MatrixConfig, McpConfig, McpServerConfig,
+    McpTransport, MemoryConfig, MemoryPolicyConfig, Microsoft365Config, ModelRouteConfig,
+    MultimodalConfig, NextcloudTalkConfig, NodeTransportConfig, NodesConfig, NotionConfig,
+    ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig, OpenVpnTunnelConfig, OtpConfig,
+    OtpMethod, PacingConfig, PeripheralBoardConfig, PeripheralsConfig, PiperTtsConfig,
+    PluginsConfig, ProjectIntelConfig, ProxyConfig, ProxyScope, QdrantConfig,
+    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
+    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
+    SecurityOpsConfig, SkillCreationConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig,
+    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, SwarmConfig,
+    SwarmStrategy, TelegramConfig, TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode,
+    TranscriptionConfig, TtsConfig, TunnelConfig, VerifiableIntentConfig, WebFetchConfig,
+    WebSearchConfig, WebhookConfig, WhatsAppChatPolicy, WhatsAppWebMode, WorkspaceConfig,
+    DEFAULT_GWS_SERVICES,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
@@ -56,6 +61,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         };
 
         let discord = DiscordConfig {
@@ -65,6 +71,7 @@ mod tests {
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            proxy_url: None,
         };
 
         let lark = LarkConfig {
@@ -77,6 +84,7 @@ mod tests {
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
@@ -86,6 +94,7 @@ mod tests {
             allowed_users: vec![],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {
@@ -93,6 +102,7 @@ mod tests {
             app_token: "app-token".into(),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);
