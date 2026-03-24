@@ -22,9 +22,11 @@ pub mod browser_open;
 pub mod calculator;
 pub mod canvas;
 pub mod claude_code;
+pub mod claude_code_runner;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
+pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
@@ -39,6 +41,7 @@ pub mod discord_search;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod gemini_cli;
 pub mod git_operations;
 pub mod glob_search;
 pub mod google_workspace;
@@ -55,6 +58,7 @@ pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
+pub mod llm_task;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -68,7 +72,9 @@ pub mod model_routing_config;
 pub mod model_switch;
 pub mod node_tool;
 pub mod notion_tool;
+pub mod opencode_cli;
 pub mod pdf_read;
+pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
@@ -83,6 +89,11 @@ pub mod sessions;
 pub mod shell;
 pub mod skill_http;
 pub mod skill_tool;
+pub mod sop_advance;
+pub mod sop_approve;
+pub mod sop_execute;
+pub mod sop_list;
+pub mod sop_status;
 pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
@@ -102,8 +113,10 @@ pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
 pub use canvas::{CanvasStore, CanvasTool};
 pub use claude_code::ClaudeCodeTool;
+pub use claude_code_runner::ClaudeCodeRunnerTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
+pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -114,10 +127,14 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use data_management::DataManagementTool;
 pub use delegate::DelegateTool;
+// Re-exported for downstream consumers of background delegation results.
+#[allow(unused_imports)]
+pub use delegate::{BackgroundDelegateResult, BackgroundTaskStatus};
 pub use discord_search::DiscordSearchTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use gemini_cli::GeminiCliTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 pub use google_workspace::GoogleWorkspaceTool;
@@ -133,6 +150,7 @@ pub use image_info::ImageInfoTool;
 pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
+pub use llm_task::LlmTaskTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -145,11 +163,13 @@ pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
+pub use opencode_cli::OpenCodeCliTool;
 pub use pdf_read::PdfReadTool;
+pub use poll::{ChannelMapHandle, PollTool};
 pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
-pub use reaction::{ChannelMapHandle, ReactionTool};
+pub use reaction::ReactionTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -162,6 +182,11 @@ pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
 #[allow(unused_imports)]
 pub use skill_tool::SkillShellTool;
+pub use sop_advance::SopAdvanceTool;
+pub use sop_approve::SopApproveTool;
+pub use sop_execute::SopExecuteTool;
+pub use sop_list::SopListTool;
+pub use sop_status::SopStatusTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
@@ -291,7 +316,11 @@ pub fn register_skill_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -310,6 +339,7 @@ pub fn all_tools(
     Vec<Box<dyn Tool>>,
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
+    ChannelMapHandle,
 ) {
     all_tools_with_runtime(
         config,
@@ -330,7 +360,11 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -350,6 +384,7 @@ pub fn all_tools_with_runtime(
     Vec<Box<dyn Tool>>,
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
+    ChannelMapHandle,
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
@@ -403,6 +438,40 @@ pub fn all_tools_with_runtime(
                 tracing::warn!("discord_search: failed to open discord.db: {e}");
             }
         }
+    }
+
+    // LLM task tool — always registered when a provider is configured
+    {
+        let llm_task_provider = root_config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        let llm_task_model = root_config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let llm_task_runtime_options = crate::providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: root_config.api_url.clone(),
+            zeroclaw_dir: root_config
+                .config_path
+                .parent()
+                .map(std::path::PathBuf::from),
+            secrets_encrypt: root_config.secrets.encrypt,
+            reasoning_enabled: root_config.runtime.reasoning_enabled,
+            reasoning_effort: root_config.runtime.reasoning_effort.clone(),
+            provider_timeout_secs: Some(root_config.provider_timeout_secs),
+            extra_headers: root_config.extra_headers.clone(),
+            api_path: root_config.api_path.clone(),
+        };
+        tool_arcs.push(Arc::new(LlmTaskTool::new(
+            security.clone(),
+            llm_task_provider,
+            llm_task_model,
+            root_config.default_temperature,
+            root_config.api_key.clone(),
+            llm_task_runtime_options,
+        )));
     }
 
     if matches!(
@@ -474,6 +543,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
+            web_fetch_config.firecrawl.clone(),
         )));
     }
 
@@ -606,6 +676,43 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Claude Code task runner with Slack progress and SSH handoff
+    if root_config.claude_code_runner.enabled {
+        let gateway_url = format!(
+            "http://{}:{}",
+            root_config.gateway.host, root_config.gateway.port
+        );
+        tool_arcs.push(Arc::new(ClaudeCodeRunnerTool::new(
+            security.clone(),
+            root_config.claude_code_runner.clone(),
+            gateway_url,
+        )));
+    }
+
+    // Codex CLI delegation tool
+    if root_config.codex_cli.enabled {
+        tool_arcs.push(Arc::new(CodexCliTool::new(
+            security.clone(),
+            root_config.codex_cli.clone(),
+        )));
+    }
+
+    // Gemini CLI delegation tool
+    if root_config.gemini_cli.enabled {
+        tool_arcs.push(Arc::new(GeminiCliTool::new(
+            security.clone(),
+            root_config.gemini_cli.clone(),
+        )));
+    }
+
+    // OpenCode CLI delegation tool
+    if root_config.opencode_cli.enabled {
+        tool_arcs.push(Arc::new(OpenCodeCliTool::new(
+            security.clone(),
+            root_config.opencode_cli.clone(),
+        )));
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -644,6 +751,25 @@ pub fn all_tools_with_runtime(
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
         )));
+    }
+
+    // Poll tool — always registered; uses late-bound channel map handle
+    let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+    tool_arcs.push(Arc::new(PollTool::new(
+        security.clone(),
+        Arc::clone(&channel_map_handle),
+    )));
+
+    // SOP tools (registered when sops_dir is configured)
+    if root_config.sop.sops_dir.is_some() {
+        let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            root_config.sop.clone(),
+        )));
+        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
     }
 
     if let Some(key) = composio_key {
@@ -691,6 +817,7 @@ pub fn all_tools_with_runtime(
                     boxed_registry_from_arcs(tool_arcs),
                     None,
                     Some(reaction_handle),
+                    channel_map_handle,
                 );
             }
 
@@ -879,6 +1006,7 @@ pub fn all_tools_with_runtime(
         boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
         Some(reaction_handle),
+        channel_map_handle,
     )
 }
 
@@ -923,7 +1051,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -966,7 +1094,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1120,7 +1248,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1154,7 +1282,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1189,7 +1317,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
@@ -1224,7 +1352,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
