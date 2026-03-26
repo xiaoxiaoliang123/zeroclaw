@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -40,6 +40,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Verify benchmarks compile
+        run: cargo bench --no-run --locked
 
   lint-strict-delta:
     name: Strict Delta Lint

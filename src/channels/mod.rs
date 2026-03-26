@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod acp_server;
 pub mod bluesky;
 pub mod clawdtalk;
 pub mod cli;
@@ -49,6 +50,7 @@ pub mod traits;
 pub mod transcription;
 pub mod tts;
 pub mod twitter;
+pub mod voice_call;
 #[cfg(feature = "voice-wake")]
 pub mod voice_wake;
 pub mod wati;
@@ -90,6 +92,8 @@ pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
+#[allow(unused_imports)]
+pub use voice_call::{VoiceCallChannel, VoiceCallConfig};
 #[cfg(feature = "voice-wake")]
 pub use voice_wake::VoiceWakeChannel;
 pub use wati::WatiChannel;
@@ -719,6 +723,28 @@ fn strip_tool_result_content(text: &str) -> String {
     }
 
     cleaned.to_string()
+}
+
+/// Remove a leading `[Used tools: ...]` line from a cached assistant turn.
+///
+/// The tool-context summary is prepended to history entries so the LLM retains
+/// awareness of prior tool usage. However, when these entries are loaded back
+/// into the LLM context, the bracket-format leaks into generated output and
+/// gets forwarded to end users as-is (bug #4400). Stripping the prefix on
+/// reload prevents the model from learning and reproducing this internal format.
+fn strip_tool_summary_prefix(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("[Used tools:") {
+        // Find the closing bracket, then skip it and any leading newline(s).
+        if let Some(bracket_end) = rest.find(']') {
+            let after_bracket = &rest[bracket_end + 1..];
+            let trimmed = after_bracket.trim_start_matches('\n');
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            return trimmed.to_string();
+        }
+    }
+    text.to_string()
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
@@ -1772,6 +1798,7 @@ async fn build_memory_context(
 /// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
 /// or native tool-call JSON to collect tool names used.
 /// Returns an empty string when no tools were invoked.
+#[cfg(test)]
 fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
     fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
         let candidate = name.trim();
@@ -1867,12 +1894,28 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
+    // Strip any [Used tools: ...] prefix that the LLM may have echoed from
+    // history context (#4400). Trim first to handle leading/trailing whitespace.
+    let trimmed_response = response.trim();
+    let stripped_summary = strip_tool_summary_prefix(trimmed_response);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
-    let stripped_xml = strip_tool_call_tags(response);
+    let stripped_xml = strip_tool_call_tags(&stripped_summary);
     // Strip isolated tool-call JSON artifacts
     let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
     // Strip leading narration lines that announce tool usage
-    strip_tool_narration(&stripped_json)
+    let sanitized = strip_tool_narration(&stripped_json);
+
+    // Scan for credential leaks before returning to caller
+    match crate::security::LeakDetector::new().scan(&sanitized) {
+        crate::security::LeakResult::Clean => sanitized,
+        crate::security::LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                patterns = ?patterns,
+                "output guardrail: credential leak detected in outbound channel response"
+            );
+            redacted
+        }
+    }
 }
 
 /// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
@@ -2412,6 +2455,14 @@ async fn process_channel_message(
         }
     }
 
+    // Strip [Used tools: ...] prefixes from cached assistant turns so the
+    // LLM never sees (and reproduces) this internal summary format (#4400).
+    for turn in &mut prior_turns {
+        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
+            turn.content = strip_tool_summary_prefix(&turn.content);
+        }
+    }
+
     // Strip [IMAGE:] markers from *older* history messages when the active
     // provider does not support vision. This prevents "history poisoning"
     // where a previously-sent image marker gets reloaded from the JSONL
@@ -2520,7 +2571,7 @@ async fn process_channel_message(
     );
 
     let (delta_tx, delta_rx) = if use_streaming {
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::agent::loop_::DraftEvent>(64);
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -2556,18 +2607,30 @@ async fn process_channel_message(
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
         Some(tokio::spawn(async move {
+            use crate::agent::loop_::DraftEvent;
             let mut accumulated = String::new();
-            while let Some(delta) = rx.recv().await {
-                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
-                    accumulated.clear();
-                    continue;
-                }
-                accumulated.push_str(&delta);
-                if let Err(e) = channel
-                    .update_draft(&reply_target, &draft_id, &accumulated)
-                    .await
-                {
-                    tracing::debug!("Draft update failed: {e}");
+            while let Some(event) = rx.recv().await {
+                match event {
+                    DraftEvent::Clear => {
+                        accumulated.clear();
+                    }
+                    DraftEvent::Progress(text) => {
+                        if let Err(e) = channel
+                            .update_draft_progress(&reply_target, &draft_id, &text)
+                            .await
+                        {
+                            tracing::debug!("Draft progress update failed: {e}");
+                        }
+                    }
+                    DraftEvent::Content(text) => {
+                        accumulated.push_str(&text);
+                        if let Err(e) = channel
+                            .update_draft(&reply_target, &draft_id, &accumulated)
+                            .await
+                        {
+                            tracing::debug!("Draft update failed: {e}");
+                        }
+                    }
                 }
             }
         }))
@@ -2627,9 +2690,6 @@ async fn process_channel_message(
             }
         }))
     };
-
-    // Record history length before tool loop so we can extract tool context after.
-    let history_len_before_tools = history.len();
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -2738,6 +2798,8 @@ async fn process_channel_message(
         break loop_result;
     };
 
+    // Drop the delta sender so the draft updater task can finish
+    // (rx.recv() returns None only when all senders are dropped).
     tracing::debug!("Post-loop: dropping delta_tx and awaiting draft updater");
     drop(delta_tx);
     if let Some(handle) = draft_updater {
@@ -2816,6 +2878,11 @@ async fn process_channel_message(
                 {
                     crate::hooks::HookResult::Cancel(reason) => {
                         tracing::info!(%reason, "outgoing message suppressed by hook");
+                        if let (Some(channel), Some(draft_id)) =
+                            (target_channel.as_ref(), draft_message_id.as_deref())
+                        {
+                            let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                        }
                         return;
                     }
                     crate::hooks::HookResult::Continue((
@@ -2886,15 +2953,15 @@ async fn process_channel_message(
                 }),
             );
 
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
+            // Previously we prepended a `[Used tools: …]` summary to the
+            // history entry so the LLM retained awareness of prior tool usage.
+            // This caused the model to learn and reproduce the bracket format
+            // in its own output, which leaked to end-users as raw log lines
+            // instead of meaningful responses (#4400).  The LLM already
+            // receives tool context through the tool-call/result messages in
+            // the conversation history built by `run_tool_call_loop`, so the
+            // extra summary prefix is unnecessary.
+            let history_response = delivered_response.clone();
 
             append_sender_turn(
                 ctx.as_ref(),
@@ -3909,11 +3976,13 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     sl.bot_token.clone(),
                     sl.app_token.clone(),
                     sl.channel_id.clone(),
-                    Vec::new(),
+                    sl.channel_ids.clone(),
                     sl.allowed_users.clone(),
                 )
                 .with_workspace_dir(config.workspace_dir.clone())
-                .with_transcription(config.transcription.clone()),
+                .with_markdown_blocks(sl.use_markdown_blocks)
+                .with_transcription(config.transcription.clone())
+                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms),
             ))
         }
         other => anyhow::bail!("Unknown channel '{other}'. Supported: telegram, discord, slack"),
@@ -4038,14 +4107,16 @@ fn collect_configured_channels(
                     sl.bot_token.clone(),
                     sl.app_token.clone(),
                     sl.channel_id.clone(),
-                    Vec::new(),
+                    sl.channel_ids.clone(),
                     sl.allowed_users.clone(),
                 )
                 .with_thread_replies(sl.thread_replies.unwrap_or(true))
                 .with_group_reply_policy(sl.mention_only, Vec::new())
                 .with_workspace_dir(config.workspace_dir.clone())
+                .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_proxy_url(sl.proxy_url.clone())
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms),
             ),
         });
     }
@@ -4079,16 +4150,24 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_full(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.allowed_rooms.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
+            channel: Arc::new(
+                MatrixChannel::new_full(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                    mx.allowed_rooms.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                )
+                .with_streaming(
+                    mx.stream_mode,
+                    mx.draft_update_interval_ms,
+                    mx.multi_message_delay_ms,
+                )
+                .with_transcription(config.transcription.clone()),
+            ),
         });
     }
 
@@ -4525,6 +4604,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
+        provider_max_tokens: config.provider_max_tokens,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -4584,23 +4664,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch, reaction_handle_ch, _channel_map_handle) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &workspace,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-            None,
-        );
+    let (
+        mut built_tools,
+        delegate_handle_ch,
+        reaction_handle_ch,
+        _channel_map_handle,
+        ask_user_handle_ch,
+    ) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &workspace,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None,
+    );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
@@ -4877,6 +4962,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Populate the reaction tool's channel map now that channels are initialized.
     if let Some(ref handle) = reaction_handle_ch {
+        let mut map = handle.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
+    // Populate the ask_user tool's channel map now that channels are initialized.
+    if let Some(ref handle) = ask_user_handle_ch {
         let mut map = handle.write();
         for (name, ch) in channels_by_name.as_ref() {
             map.insert(name.clone(), Arc::clone(ch));
@@ -5206,6 +5299,48 @@ mod tests {
             "no tool results here"
         );
         assert_eq!(strip_tool_result_content(""), "");
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_removes_prefix_and_preserves_content() {
+        let input = "[Used tools: browser_open, shell]\nI opened the page successfully.";
+        assert_eq!(
+            strip_tool_summary_prefix(input),
+            "I opened the page successfully."
+        );
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_returns_empty_when_only_prefix() {
+        let input = "[Used tools: browser_open]";
+        assert_eq!(strip_tool_summary_prefix(input), "");
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_preserves_text_without_prefix() {
+        let input = "Here is the result of the search.";
+        assert_eq!(strip_tool_summary_prefix(input), input);
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_handles_multiple_newlines() {
+        let input = "[Used tools: shell]\n\nThe command output is 42.";
+        assert_eq!(
+            strip_tool_summary_prefix(input),
+            "The command output is 42."
+        );
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_used_tools_with_leading_whitespace() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        // Issue #4478: response with leading whitespace before [Used tools: ...]
+        let input = "  [Used tools: web_search_tool]\nHere is the search result.";
+
+        let result = sanitize_channel_response(input, &tools);
+
+        assert!(!result.contains("[Used tools:"));
+        assert!(result.contains("Here is the search result."));
     }
 
     #[test]
@@ -10486,5 +10621,26 @@ This is an example JSON object for profile settings."#;
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
         );
+    }
+
+    #[test]
+    fn sanitize_channel_response_redacts_detected_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+
+        let result = sanitize_channel_response(leaked, &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
+        assert!(result.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_passes_clean_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let clean_text = "This is a normal message with no credentials.";
+
+        let result = sanitize_channel_response(clean_text, &tools);
+
+        assert_eq!(result, clean_text);
     }
 }

@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod ask_user;
 pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
@@ -65,15 +66,18 @@ pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
 pub mod memory_forget;
+pub mod memory_purge;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod microsoft365;
 pub mod model_routing_config;
 pub mod model_switch;
+pub mod node_capabilities;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod opencode_cli;
 pub mod pdf_read;
+pub mod pipeline;
 pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
@@ -105,6 +109,7 @@ mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
 
+pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 #[allow(unused_imports)]
@@ -155,6 +160,7 @@ pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
+pub use memory_purge::MemoryPurgeTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use microsoft365::Microsoft365Tool;
@@ -340,6 +346,7 @@ pub fn all_tools(
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
     ChannelMapHandle,
+    Option<ChannelMapHandle>,
 ) {
     all_tools_with_runtime(
         config,
@@ -385,15 +392,15 @@ pub fn all_tools_with_runtime(
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
     ChannelMapHandle,
+    Option<ChannelMapHandle>,
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new_with_sandbox(
-            security.clone(),
-            runtime,
-            sandbox,
-        )),
+        Arc::new(
+            ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                .with_timeout_secs(root_config.shell_tool.timeout_secs),
+        ),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -407,7 +414,8 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryPurgeTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -463,6 +471,7 @@ pub fn all_tools_with_runtime(
             provider_timeout_secs: Some(root_config.provider_timeout_secs),
             extra_headers: root_config.extra_headers.clone(),
             api_path: root_config.api_path.clone(),
+            provider_max_tokens: root_config.provider_max_tokens,
         };
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
@@ -544,6 +553,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
             web_fetch_config.firecrawl.clone(),
+            web_fetch_config.allowed_private_hosts.clone(),
         )));
     }
 
@@ -787,6 +797,11 @@ pub fn all_tools_with_runtime(
     let reaction_handle = reaction_tool.channel_map_handle();
     tool_arcs.push(Arc::new(reaction_tool));
 
+    // Interactive ask_user tool — always registered; channel map populated later by start_channels.
+    let ask_user_tool = AskUserTool::new(security.clone());
+    let ask_user_handle = ask_user_tool.channel_map_handle();
+    tool_arcs.push(Arc::new(ask_user_tool));
+
     // Microsoft 365 Graph API integration
     if root_config.microsoft365.enabled {
         let ms_cfg = &root_config.microsoft365;
@@ -818,6 +833,7 @@ pub fn all_tools_with_runtime(
                     None,
                     Some(reaction_handle),
                     channel_map_handle,
+                    Some(ask_user_handle),
                 );
             }
 
@@ -885,6 +901,7 @@ pub fn all_tools_with_runtime(
         reasoning_enabled: root_config.runtime.reasoning_enabled,
         reasoning_effort: root_config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(root_config.provider_timeout_secs),
+        provider_max_tokens: root_config.provider_max_tokens,
         extra_headers: root_config.extra_headers.clone(),
         api_path: root_config.api_path.clone(),
     };
@@ -1002,11 +1019,21 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // Pipeline tool (execute_pipeline) — multi-step tool chaining.
+    if root_config.pipeline.enabled {
+        let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
+        tool_arcs.push(Arc::new(pipeline::PipelineTool::new(
+            root_config.pipeline.clone(),
+            pipeline_tools,
+        )));
+    }
+
     (
         boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
         Some(reaction_handle),
         channel_map_handle,
+        Some(ask_user_handle),
     )
 }
 
@@ -1051,7 +1078,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1094,7 +1121,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1248,7 +1275,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1282,7 +1309,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1317,7 +1344,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
@@ -1352,7 +1379,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
